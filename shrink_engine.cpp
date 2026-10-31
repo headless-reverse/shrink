@@ -11,6 +11,14 @@
 #include <limits>
 #include <span>
 #include <sys/stat.h>
+#include <functional>
+#include <iterator>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <cstring>
+#include <pthread.h>
+#include <ctime>
 
 namespace shrink {
 
@@ -199,7 +207,7 @@ bool GitIgnoreEngine::is_ignored(std::string_view rel_path, bool is_dir) const n
 
 namespace {
 
-std::vector<Token> tokenize_cpp(std::string_view src, std::span<const size_t> excluded_lines) {
+std::vector<Token> tokenize_cpp(std::string_view src, std::span<const size_t> excluded_lines, bool java = false) {
 	std::vector<Token> tokens;
 	tokens.reserve(src.size() / 16);
 	size_t i = 0, n = src.size(), code_start = 0;
@@ -265,7 +273,16 @@ std::vector<Token> tokenize_cpp(std::string_view src, std::span<const size_t> ex
 		}
 		if (c == '"') {
 			flush_code(code_start, i);
-			size_t start = i++;
+			size_t start = i;
+			if (java && i + 2 < n && src[i + 1] == '"' && src[i + 2] == '"') {
+				i += 3;
+				while (i + 2 < n && src.substr(i, 3) != "\"\"\"") ++i;
+				if (i + 2 < n) i += 3;
+				tokens.push_back({TokenType::String, src.substr(start, i - start), {}, false});
+				code_start = i;
+				continue;
+			}
+			++i;
 			while (i < n) {
 				size_t esc = skip_escaped_newline(src, i);
 				if (esc > 0) i += esc;
@@ -317,6 +334,687 @@ std::vector<Token> tokenize_cpp(std::string_view src, std::span<const size_t> ex
 	flush_code(code_start, n);
 	split_excluded_code_lines(tokens, excluded_lines);
 	return tokens;
+}
+
+std::vector<Token> tokenize_xml(std::string_view src, std::span<const size_t> excluded_lines) {
+	std::vector<Token> tokens;
+	size_t i = 0, codeStart = 0;
+	while (i < src.size()) {
+		if (i + 3 < src.size() && src.substr(i, 4) == "<!--") {
+			if (i > codeStart) tokens.push_back({TokenType::Code, src.substr(codeStart, i - codeStart), {}, false});
+			const size_t commentStart = i;
+			size_t end = src.find("-->", i + 4);
+			i = end == std::string_view::npos ? src.size() : end + 3;
+			tokens.push_back({TokenType::Comment, src.substr(commentStart, i - commentStart), {}, false});
+			codeStart = i;
+		} else if (src[i] == '<') {
+			char quote = '\0';
+			size_t end = i + 1;
+			for (; end < src.size(); ++end) {
+				if (quote) { if (src[end] == quote) quote = '\0'; }
+				else if (src[end] == '\'' || src[end] == '"') quote = src[end];
+				else if (src[end] == '>') break;
+			}
+			if (end < src.size()) {
+				if (i > codeStart) tokens.push_back({TokenType::Code, src.substr(codeStart, i - codeStart), {}, false});
+				tokens.push_back({TokenType::XmlTag, src.substr(i, end - i + 1), {}, false});
+				i = end + 1;
+				codeStart = i;
+			} else ++i;
+		} else {
+			++i;
+		}
+	}
+	if (codeStart < src.size()) tokens.push_back({TokenType::Code, src.substr(codeStart), {}, false});
+	split_excluded_code_lines(tokens, excluded_lines);
+	return tokens;
+}
+
+std::string java_code_mask(std::string_view source) {
+	std::string mask(source);
+	for (size_t i = 0; i < source.size();) {
+		size_t end = i;
+		if (source[i] == '"' && i + 2 < source.size() && source.substr(i, 3) == "\"\"\"") {
+			end = source.find("\"\"\"", i + 3);
+			end = end == std::string_view::npos ? source.size() : end + 3;
+		} else if (source[i] == '"' || source[i] == '\'') {
+			const char quote = source[i];
+			end = i + 1;
+			while (end < source.size()) {
+				if (source[end] == '\\') { end = std::min(source.size(), end + 2); continue; }
+				if (source[end++] == quote) break;
+			}
+		} else if (source[i] == '/' && i + 1 < source.size() && source[i + 1] == '/') {
+			end = source.find('\n', i + 2);
+			end = end == std::string_view::npos ? source.size() : end;
+		} else if (source[i] == '/' && i + 1 < source.size() && source[i + 1] == '*') {
+			end = source.find("*/", i + 2);
+			end = end == std::string_view::npos ? source.size() : end + 2;
+		} else { ++i; continue; }
+		for (size_t j = i; j < end; ++j) if (mask[j] != '\n' && mask[j] != '\r') mask[j] = ' ';
+		i = end;
+	}
+	return mask;
+}
+
+void transform_java(std::string &source, const Options &opt) {
+	if (opt.strip_unused_imports) {
+		const std::string mask = java_code_mask(source);
+		static const re2::RE2 importPattern("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*");
+		std::unordered_map<std::string, size_t> identifierCounts;
+		for (size_t pos = 0; pos < mask.size();) {
+			if (!is_ident(mask[pos])) { ++pos; continue; }
+			const size_t start = pos++;
+			while (pos < mask.size() && is_ident(mask[pos])) ++pos;
+			++identifierCounts[mask.substr(start, pos - start)];
+		}
+		for (size_t lineStart = 0; lineStart < source.size();) {
+			size_t lineEnd = source.find('\n', lineStart);
+			if (lineEnd == std::string::npos) lineEnd = source.size();
+			std::string_view line(mask.data() + lineStart, lineEnd - lineStart);
+			size_t first = line.find_first_not_of(" \t\r");
+			if (first != std::string_view::npos && line.substr(first).starts_with("import ")) {
+				size_t semi = line.find(';', first + 7);
+				if (semi != std::string_view::npos) {
+					size_t nameStart = line.find_first_not_of(" \t", first + 7);
+					if (nameStart != std::string_view::npos && line.substr(nameStart).starts_with("static ")) nameStart = line.find_first_not_of(" \t", nameStart + 7);
+					if (nameStart == std::string_view::npos || nameStart >= semi) { lineStart = lineEnd + (lineEnd < source.size() ? 1 : 0); continue; }
+					std::string_view importName = line.substr(nameStart, semi - nameStart);
+					if (!re2::RE2::FullMatch(std::string(importName), importPattern)) {
+						lineStart = lineEnd + (lineEnd < source.size() ? 1 : 0);
+						continue;
+					}
+					size_t dot = importName.rfind('.');
+					std::string_view symbol = dot == std::string_view::npos ? importName : importName.substr(dot + 1);
+					if (!symbol.empty() && symbol != "*") {
+						auto count = identifierCounts.find(std::string(symbol));
+						if (count != identifierCounts.end() && count->second == 1) for (size_t i = lineStart; i < lineEnd; ++i) if (source[i] != '\r') source[i] = ' ';
+					}
+				}
+			}
+			lineStart = lineEnd + (lineEnd < source.size() ? 1 : 0);
+		}
+	}
+	if (opt.strip_debug) {
+		const std::string_view targets[] = {"System.out.println", "Log.d", "Log.v", "Log.i", "e.printStackTrace"};
+		const std::string mask = java_code_mask(source);
+		std::vector<std::pair<size_t, size_t>> ranges;
+		for (size_t search = 0; search < mask.size();) {
+			size_t start = std::string::npos, targetLength = 0;
+			for (auto target : targets) {
+				size_t at = mask.find(target, search);
+				if (at != std::string::npos && at < start) { start = at; targetLength = target.size(); }
+			}
+			if (start == std::string::npos) break;
+			size_t open = start + targetLength;
+			while (open < mask.size() && std::isspace(static_cast<unsigned char>(mask[open]))) ++open;
+			if (open == mask.size() || mask[open] != '(') { search = start + targetLength; continue; }
+			int depth = 0;
+			size_t close = open;
+			for (; close < mask.size(); ++close) {
+				if (mask[close] == '(') ++depth;
+				else if (mask[close] == ')' && --depth == 0) { ++close; break; }
+			}
+			while (close < mask.size() && (mask[close] == ' ' || mask[close] == '\t' || mask[close] == '\r')) ++close;
+			if (close < mask.size() && mask[close] == ';') ++close;
+			while (close < mask.size() && (mask[close] == ' ' || mask[close] == '\t')) ++close;
+			if (close < mask.size() && mask[close] == '\n' && source.find('\n', start) == close) ++close;
+			ranges.emplace_back(start, close);
+			search = close;
+		}
+		for (const auto &[start, end] : ranges) for (size_t i = start; i < end; ++i) if (source[i] != '\n' && source[i] != '\r') source[i] = ' ';
+	}
+	if (opt.strip_annotations) {
+		const std::string mask = java_code_mask(source);
+		std::vector<std::pair<size_t, size_t>> ranges;
+		for (size_t search = 0; search < mask.size();) {
+			size_t at = mask.find('@', search);
+			if (at == std::string::npos) break;
+			size_t end = at + 1;
+			while (end < mask.size() && (std::isalnum(static_cast<unsigned char>(mask[end])) || mask[end] == '_' || mask[end] == '.' || mask[end] == '$')) ++end;
+			if (end == at + 1) { search = at + 1; continue; }
+			while (end < mask.size() && std::isspace(static_cast<unsigned char>(mask[end]))) ++end;
+			if (end < mask.size() && mask[end] == '(') {
+				int depth = 0;
+				for (; end < mask.size(); ++end) {
+					if (mask[end] == '(') ++depth;
+					else if (mask[end] == ')' && --depth == 0) { ++end; break; }
+				}
+			}
+			ranges.emplace_back(at, end);
+			search = end;
+		}
+		for (const auto &[start, end] : ranges) for (size_t i = start; i < end; ++i) if (source[i] != '\n' && source[i] != '\r') source[i] = ' ';
+	}
+	if (opt.extract_skeleton) {
+		std::string mask = java_code_mask(source);
+		std::vector<std::pair<size_t, size_t>> ranges;
+		for (size_t i = 0; i < source.size(); ++i) {
+			if (mask[i] != '{') continue;
+			size_t prev = i;
+			while (prev > 0 && std::isspace(static_cast<unsigned char>(mask[prev - 1]))) --prev;
+			if (prev == 0 || mask[prev - 1] != ')') continue;
+			size_t headerStart = prev - 1;
+			while (headerStart > 0 && mask[headerStart - 1] != ';' && mask[headerStart - 1] != '{' && mask[headerStart - 1] != '}') --headerStart;
+			std::string_view header(mask.data() + headerStart, prev - headerStart);
+			auto hasKeyword = [&](std::string_view keyword) {
+				size_t at = header.find(keyword);
+				while (at != std::string_view::npos) {
+					if ((at == 0 || !is_ident(header[at - 1])) && (at + keyword.size() == header.size() || !is_ident(header[at + keyword.size()]))) return true;
+					at = header.find(keyword, at + 1);
+				}
+				return false;
+			};
+			if (hasKeyword("if") || hasKeyword("for") || hasKeyword("while") || hasKeyword("switch") ||
+				hasKeyword("catch") || hasKeyword("synchronized")) continue;
+			int depth = 1;
+			size_t end = i + 1;
+			for (; end < mask.size() && depth; ++end) {
+				if (mask[end] == '{') ++depth;
+				else if (mask[end] == '}') --depth;
+			}
+			if (depth == 0) {
+				ranges.emplace_back(i, end);
+				i += 1;
+			}
+		}
+		for (const auto &[start, end] : ranges) {
+			for (size_t i = start + 1; i + 1 < end; ++i) if (source[i] != '\n' && source[i] != '\r') source[i] = ' ';
+		}
+	}
+}
+
+void transform_xml(std::string &source, const Options &opt) {
+	std::string out;
+	out.reserve(source.size());
+	bool inTag = false;
+	char activeQuote = '\0';
+	for (size_t i = 0; i < source.size();) {
+		if (source.compare(i, 4, "<!--") == 0) {
+			size_t end = source.find("-->", i + 4);
+			end = end == std::string::npos ? source.size() : end + 3;
+			out.append(source, i, end - i);
+		i = end;
+			inTag = false;
+			activeQuote = '\0';
+			continue;
+		}
+		if (source.compare(i, 9, "<![CDATA[") == 0) {
+			size_t end = source.find("]]>", i + 9);
+			end = end == std::string::npos ? source.size() : end + 3;
+			out.append(source, i, end - i);
+			i = end;
+			inTag = false;
+			activeQuote = '\0';
+			continue;
+		}
+		if (opt.collapse_empty_tags && source[i] == '<' && i + 1 < source.size() && source[i + 1] != '/' && source[i + 1] != '!' && source[i + 1] != '?') {
+			char quote = '\0';
+			size_t tagEnd = i + 1;
+			for (; tagEnd < source.size(); ++tagEnd) {
+				if (quote) { if (source[tagEnd] == quote) quote = '\0'; }
+				else if (source[tagEnd] == '\'' || source[tagEnd] == '"') quote = source[tagEnd];
+				else if (source[tagEnd] == '>') break;
+			}
+			if (tagEnd < source.size() && source[tagEnd - 1] != '/') {
+				size_t nameEnd = i + 1;
+				while (nameEnd < tagEnd && !std::isspace(static_cast<unsigned char>(source[nameEnd])) && source[nameEnd] != '/') ++nameEnd;
+				std::string closeTag = "</" + source.substr(i + 1, nameEnd - i - 1) + ">";
+				size_t contentEnd = tagEnd + 1;
+				while (contentEnd < source.size() && std::isspace(static_cast<unsigned char>(source[contentEnd]))) ++contentEnd;
+				if (source.compare(contentEnd, closeTag.size(), closeTag) == 0) {
+					out.append(source, i, tagEnd - i);
+					out += "/>";
+					i = contentEnd + closeTag.size();
+					continue;
+				}
+			}
+		}
+		const char c = source[i];
+		out.push_back(c);
+		if (inTag && activeQuote) {
+			if (c == activeQuote) activeQuote = '\0';
+		} else if (inTag && (c == '\'' || c == '"')) activeQuote = c;
+		else if (!inTag && c == '<') inTag = true;
+		else if (inTag && c == '>') {
+			inTag = false;
+			if (!opt.collapse_tags_whitespace) { ++i; continue; }
+			size_t end = i + 1;
+			while (end < source.size() && std::isspace(static_cast<unsigned char>(source[end]))) ++end;
+			if (end < source.size() && source[end] == '<') i = end - 1;
+		}
+		++i;
+	}
+	source = std::move(out);
+}
+
+size_t scan_js_template(std::string_view src, size_t start);
+
+size_t scan_js_expression(std::string_view src, size_t start) {
+	int depth = 1;
+	for (size_t i = start; i < src.size();) {
+		if (src[i] == '\'' || src[i] == '"') {
+			const char quote = src[i++];
+			while (i < src.size()) {
+				if (src[i] == '\\') { i = std::min(src.size(), i + 2); continue; }
+				if (src[i++] == quote) break;
+			}
+		} else if (src[i] == '`') i = scan_js_template(src, i);
+		else if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+			i += 2;
+			while (i < src.size() && src[i] != '\n') ++i;
+		} else if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+			i += 2;
+			while (i + 1 < src.size() && src.substr(i, 2) != "*/") ++i;
+			i = std::min(src.size(), i + 2);
+		} else if (src[i] == '/') {
+			size_t prev = i;
+			while (prev > start && std::isspace(static_cast<unsigned char>(src[prev - 1]))) --prev;
+			const bool regexAllowed = prev == start || std::string_view("=(:,[!&|?{};>").find(src[prev - 1]) != std::string_view::npos;
+			if (!regexAllowed) { ++i; continue; }
+			++i;
+			bool inClass = false;
+			while (i < src.size() && src[i] != '\n') {
+				if (src[i] == '\\') { i = std::min(src.size(), i + 2); continue; }
+				if (src[i] == '[') inClass = true;
+				else if (src[i] == ']') inClass = false;
+				else if (src[i] == '/' && !inClass) { ++i; while (i < src.size() && std::isalpha(static_cast<unsigned char>(src[i]))) ++i; break; }
+				++i;
+			}
+		} else if (src[i] == '{') { ++depth; ++i; }
+		else if (src[i] == '}') { if (--depth == 0) return i + 1; ++i; }
+		else ++i;
+	}
+	return src.size();
+}
+
+size_t scan_js_template(std::string_view src, size_t start) {
+	size_t i = start + 1;
+	while (i < src.size()) {
+		if (src[i] == '\\') { i = std::min(src.size(), i + 2); continue; }
+		if (src[i] == '`') return i + 1;
+		if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') { i = scan_js_expression(src, i + 2); continue; }
+		++i;
+	}
+	return src.size();
+}
+
+std::vector<Token> tokenize_web(std::string_view src, Language lang) {
+	std::vector<Token> tokens;
+	size_t i = 0, codeStart = 0;
+	auto flushCode = [&](size_t end) { if (end > codeStart) tokens.push_back({TokenType::Code, src.substr(codeStart, end - codeStart), {}, false}); };
+	while (i < src.size()) {
+		const char c = src[i];
+		if ((lang == Language::Php && c == '<' && src.substr(i, 5) == "<?php") ||
+			(lang == Language::Php && c == '<' && src.substr(i, 3) == "<?=")) {
+			const size_t len = src.substr(i, 5) == "<?php" ? 5 : 3;
+			flushCode(i);
+			tokens.push_back({TokenType::XmlTag, src.substr(i, len), {}, false});
+			i += len;
+			codeStart = i;
+			continue;
+		}
+		if ((lang == Language::JavaScript || lang == Language::Php) && c == '`') {
+			flushCode(i);
+			const size_t start = i;
+			i = lang == Language::JavaScript ? scan_js_template(src, i) : i + 1;
+			if (lang == Language::Php) while (i < src.size()) { if (src[i] == '\\') i = std::min(src.size(), i + 2); else if (src[i++] == '`') break; }
+			tokens.push_back({TokenType::Template, src.substr(start, i - start), {}, false});
+			codeStart = i;
+			continue;
+		}
+		if (c == '"' || c == '\'') {
+			flushCode(i);
+			const size_t start = i++;
+			while (i < src.size()) {
+				if (src[i] == '\\') { i = std::min(src.size(), i + 2); continue; }
+				if (src[i++] == c) break;
+			}
+			tokens.push_back({TokenType::String, src.substr(start, i - start), {}, false});
+			codeStart = i;
+			continue;
+		}
+		if (c == '/' && i + 1 < src.size() &&
+			(src[i + 1] == '*' || (src[i + 1] == '/' && (lang == Language::JavaScript || lang == Language::Php)))) {
+			flushCode(i);
+			const size_t start = i;
+			if (src[i + 1] == '/') {
+				i += 2;
+				while (i < src.size() && src[i] != '\n') ++i;
+			} else {
+				i += 2;
+				while (i + 1 < src.size() && src.substr(i, 2) != "*/") ++i;
+				i = std::min(src.size(), i + 2);
+			}
+			tokens.push_back({TokenType::Comment, src.substr(start, i - start), {}, false});
+			codeStart = i;
+			continue;
+		}
+		if (lang == Language::Php && c == '#' && (i + 1 >= src.size() || src[i + 1] != '[')) {
+			flushCode(i);
+			const size_t start = i++;
+			while (i < src.size() && src[i] != '\n') ++i;
+			tokens.push_back({TokenType::Comment, src.substr(start, i - start), {}, false});
+			codeStart = i;
+			continue;
+		}
+		if (lang == Language::Php && c == '<' && src.substr(i, 3) == "<<<") {
+			const size_t lineEnd = src.find('\n', i);
+			if (lineEnd != std::string_view::npos) {
+				size_t idStart = i + 3;
+				while (idStart < lineEnd && std::isspace(static_cast<unsigned char>(src[idStart]))) ++idStart;
+				char quote = '\0';
+				if (idStart < lineEnd && (src[idStart] == '\'' || src[idStart] == '"')) quote = src[idStart++];
+				size_t idEnd = idStart;
+				while (idEnd < lineEnd && (std::isalnum(static_cast<unsigned char>(src[idEnd])) || src[idEnd] == '_')) ++idEnd;
+				std::string_view id = src.substr(idStart, idEnd - idStart);
+				if (!id.empty()) {
+					const size_t bodyStart = lineEnd + 1;
+					size_t end = bodyStart;
+					while (end < src.size()) {
+						size_t eol = src.find('\n', end);
+						if (eol == std::string_view::npos) eol = src.size();
+						size_t p = end;
+						while (p < eol && (src[p] == ' ' || src[p] == '\t')) ++p;
+						if (src.substr(p, id.size()) == id && (p + id.size() == eol || src[p + id.size()] == ';' || src[p + id.size()] == ',')) { end = eol; break; }
+						end = eol < src.size() ? eol + 1 : eol;
+					}
+					flushCode(i);
+					tokens.push_back({TokenType::HereDoc, src.substr(i, end - i), {}, false});
+					i = end;
+					codeStart = i;
+					(void)quote;
+					continue;
+				}
+			}
+		}
+		if (lang == Language::JavaScript && c == '/') {
+			size_t prev = i;
+			while (prev > codeStart && std::isspace(static_cast<unsigned char>(src[prev - 1]))) --prev;
+			bool regexAllowed = prev == codeStart || std::string_view("=(:,[!&|?{};>").find(src[prev - 1]) != std::string_view::npos;
+			if (!regexAllowed && prev >= codeStart + 6 && src.substr(prev - 6, 6) == "return") regexAllowed = true;
+			if (regexAllowed) {
+				flushCode(i);
+				const size_t start = i++;
+				bool inClass = false;
+				while (i < src.size() && src[i] != '\n') {
+					if (src[i] == '\\') { i = std::min(src.size(), i + 2); continue; }
+					if (src[i] == '[') inClass = true;
+					else if (src[i] == ']') inClass = false;
+					else if (src[i] == '/' && !inClass) { ++i; while (i < src.size() && std::isalpha(static_cast<unsigned char>(src[i]))) ++i; break; }
+					++i;
+				}
+				tokens.push_back({TokenType::Regex, src.substr(start, i - start), {}, false});
+				codeStart = i;
+				continue;
+			}
+		}
+		++i;
+	}
+	flushCode(src.size());
+	return tokens;
+}
+
+std::vector<Token> tokenize_html(std::string_view src) {
+	std::vector<Token> tokens;
+	size_t i = 0, codeStart = 0;
+	auto flushCode = [&](size_t end) { if (end > codeStart) tokens.push_back({TokenType::Code, src.substr(codeStart, end - codeStart), {}, false}); };
+	while (i < src.size()) {
+		if (src.substr(i, 4) == "<!--") {
+			flushCode(i);
+			const size_t commentStart = i;
+			const size_t end = src.find("-->", i + 4);
+			i = end == std::string_view::npos ? src.size() : end + 3;
+			tokens.push_back({TokenType::Comment, src.substr(commentStart, i - commentStart), {}, false});
+			codeStart = i;
+		} else if (src[i] == '<') {
+			char quote = '\0';
+			size_t end = i + 1;
+			for (; end < src.size(); ++end) {
+				if (quote) { if (src[end] == quote) quote = '\0'; }
+				else if (src[end] == '\'' || src[end] == '"') quote = src[end];
+				else if (src[end] == '>') break;
+			}
+			if (end == src.size()) { ++i; continue; }
+			flushCode(i);
+			const size_t tagStart = i;
+			i = end + 1;
+			std::string_view tag = src.substr(tagStart, i - tagStart);
+			tokens.push_back({TokenType::XmlTag, tag, {}, false});
+			std::string lower(tag);
+			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			Language innerLang = Language::Plain;
+			if (lower.starts_with("<script") && (lower.size() == 7 || std::isspace(static_cast<unsigned char>(lower[7])) || lower[7] == '>')) innerLang = Language::JavaScript;
+			else if (lower.starts_with("<style") && (lower.size() == 6 || std::isspace(static_cast<unsigned char>(lower[6])) || lower[6] == '>')) innerLang = Language::Css;
+			if (innerLang != Language::Plain) {
+				const std::string closeNeedle = innerLang == Language::JavaScript ? "</script" : "</style";
+				std::string rest(src.substr(i));
+				std::transform(rest.begin(), rest.end(), rest.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				const size_t relClose = rest.find(closeNeedle);
+				const size_t contentEnd = relClose == std::string::npos ? src.size() : i + relClose;
+				auto inner = tokenize_web(src.substr(i, contentEnd - i), innerLang);
+				tokens.insert(tokens.end(), inner.begin(), inner.end());
+				i = contentEnd;
+				codeStart = i;
+			}
+			codeStart = i;
+		} else ++i;
+	}
+	flushCode(src.size());
+	return tokens;
+}
+
+std::string web_code_mask(std::string_view source, Language lang) {
+	auto tokens = tokenize_web(source, lang);
+	std::string mask(source);
+	size_t offset = 0;
+	for (const auto &token : tokens) {
+		const size_t end = std::min(source.size(), offset + token.text().size());
+		if (token.type != TokenType::Code) for (size_t i = offset; i < end; ++i) if (mask[i] != '\n' && mask[i] != '\r') mask[i] = ' ';
+		offset = end;
+	}
+	return mask;
+}
+
+void transform_js_php(std::string &source, Language lang, const Options &opt) {
+	const bool js = lang == Language::JavaScript;
+	if (opt.strip_debug) {
+		const std::string_view targets[] = {"console.log", "console.debug", "var_dump", "print_r", "error_log", "debugger"};
+		const std::string mask = web_code_mask(source, lang);
+		std::vector<std::pair<size_t, size_t>> ranges;
+		for (size_t search = 0; search < mask.size();) {
+			size_t start = std::string::npos, length = 0;
+			for (auto target : targets) {
+				if ((!js && (target.starts_with("console") || target == "debugger")) || (js && !(target.starts_with("console") || target == "debugger"))) continue;
+				size_t at = mask.find(target, search);
+				if (at != std::string::npos && at < start) { start = at; length = target.size(); }
+			}
+			if (start == std::string::npos) break;
+			size_t end = start + length;
+			if (js && mask.compare(start, length, "debugger") == 0) {
+				while (end < mask.size() && mask[end] != ';' && mask[end] != '\n') ++end;
+				if (end < mask.size() && mask[end] == ';') ++end;
+			} else {
+				while (end < mask.size() && std::isspace(static_cast<unsigned char>(mask[end]))) ++end;
+				if (end == mask.size() || mask[end] != '(') { search = start + length; continue; }
+				int depth = 0;
+				for (; end < mask.size(); ++end) {
+					if (mask[end] == '(') ++depth;
+					else if (mask[end] == ')' && --depth == 0) { ++end; break; }
+				}
+				while (end < mask.size() && (mask[end] == ' ' || mask[end] == '\t' || mask[end] == '\r')) ++end;
+				if (end < mask.size() && mask[end] == ';') ++end;
+			}
+			while (start > 0 && (source[start - 1] == ' ' || source[start - 1] == '\t')) --start;
+			if (end < source.size() && source[end] == '\n' && start < source.size() && source.find('\n', start) == end) ++end;
+			ranges.emplace_back(start, end);
+			search = end;
+		}
+		for (const auto &[start, end] : ranges) for (size_t i = start; i < end; ++i) if (source[i] != '\n' && source[i] != '\r') source[i] = ' ';
+	}
+	if (js && opt.compact_arrow_functions) {
+		const std::string mask = web_code_mask(source, lang);
+		std::vector<bool> remove(source.size(), false);
+		for (size_t at = mask.find("=>"); at != std::string::npos; at = mask.find("=>", at + 2)) {
+			size_t left = at, right = at + 2;
+			while (left > 0 && (source[left - 1] == ' ' || source[left - 1] == '\t')) remove[--left] = true;
+			while (right < source.size() && (source[right] == ' ' || source[right] == '\t')) remove[right++] = true;
+		}
+		std::string compact;
+		compact.reserve(source.size());
+		for (size_t i = 0; i < source.size(); ++i) if (!remove[i]) compact.push_back(source[i]);
+		source = std::move(compact);
+	}
+	if (opt.extract_skeleton) {
+		std::string mask = web_code_mask(source, lang);
+		std::vector<std::pair<size_t, size_t>> ranges;
+		for (size_t i = 0; i < source.size(); ++i) {
+			if (mask[i] != '{') continue;
+			size_t prev = i;
+			while (prev > 0 && std::isspace(static_cast<unsigned char>(mask[prev - 1]))) --prev;
+			size_t headerStart = prev;
+			while (headerStart > 0 && mask[headerStart - 1] != ';' && mask[headerStart - 1] != '{' && mask[headerStart - 1] != '}') --headerStart;
+			std::string_view header(mask.data() + headerStart, prev - headerStart);
+			const bool candidate = header.find("function") != std::string_view::npos || header.find("class") != std::string_view::npos ||
+				(js && header.find("=>") != std::string_view::npos) || (prev > headerStart && mask[prev - 1] == ')');
+			if (!candidate || header.find("if") != std::string_view::npos || header.find("for") != std::string_view::npos || header.find("while") != std::string_view::npos || header.find("switch") != std::string_view::npos) continue;
+			if (header.find("class") != std::string_view::npos) continue;
+			int depth = 1;
+			size_t end = i + 1;
+			for (; end < mask.size() && depth; ++end) { if (mask[end] == '{') ++depth; else if (mask[end] == '}') --depth; }
+			if (depth == 0) { ranges.emplace_back(i, end); ++i; }
+		}
+		for (const auto &[start, end] : ranges) for (size_t i = start + 1; i + 1 < end; ++i) if (source[i] != '\n' && source[i] != '\r') source[i] = ' ';
+	}
+}
+
+void transform_css(std::vector<Token> &tokens, const Options &opt) {
+	if (!opt.compact_css_rules && !opt.bpe_compress) return;
+	for (auto &token : tokens) {
+		if (token.type != TokenType::Code || token.excluded || token.empty()) continue;
+		std::string text(token.text());
+		std::string out;
+		out.reserve(text.size());
+		bool inRule = false, pendingSpace = false;
+		for (char c : text) {
+			if (std::isspace(static_cast<unsigned char>(c))) { pendingSpace = true; continue; }
+			if ((opt.compact_css_rules && inRule && (c == ':' || c == ';' || c == '{' || c == '}')) ||
+				(opt.bpe_compress && (c == ':' || c == ';' || c == '{' || c == '}'))) pendingSpace = false;
+			else if (pendingSpace && !out.empty() && out.back() != '{' && out.back() != ':' && out.back() != ';' && out.back() != '}' && c != '{' && c != ':' && c != ';' && c != '}') out.push_back(' ');
+			if (c == '{') inRule = true;
+			out.push_back(c);
+			if (c == '}') inRule = false;
+			pendingSpace = false;
+		}
+		token.set_text(std::move(out));
+	}
+}
+
+void transform_html(std::vector<Token> &tokens, bool collapseWhitespace) {
+	if (!collapseWhitespace) return;
+	int preserveDepth = 0;
+	int rawDepth = 0;
+	for (size_t index = 0; index < tokens.size(); ++index) {
+		auto &token = tokens[index];
+		if (token.type == TokenType::XmlTag) {
+			std::string tag(token.text());
+			std::transform(tag.begin(), tag.end(), tag.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			const bool closing = tag.starts_with("</");
+			const bool selfClosing = tag.size() > 2 && tag[tag.size() - 2] == '/';
+			size_t nameStart = closing ? 2 : 1, nameEnd = nameStart;
+			while (nameEnd < tag.size() && std::isalpha(static_cast<unsigned char>(tag[nameEnd]))) ++nameEnd;
+			const std::string_view name(tag.data() + nameStart, nameEnd - nameStart);
+			const bool preserveTag = name == "pre" || name == "code";
+			const bool rawTag = name == "script" || name == "style";
+			if (preserveTag) {
+				if (closing) preserveDepth = std::max(0, preserveDepth - 1);
+				else if (!selfClosing) ++preserveDepth;
+			}
+			if (rawTag) {
+				if (closing) rawDepth = std::max(0, rawDepth - 1);
+				else if (!selfClosing) ++rawDepth;
+			}
+		} else if (token.type == TokenType::Code && preserveDepth == 0 && rawDepth == 0 && !token.excluded) {
+			std::string text(token.text()), out;
+			out.reserve(text.size());
+			bool whitespace = false;
+			const bool onlyWhitespace = text.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
+			if (onlyWhitespace) { token.set_text(text.empty() ? std::string() : std::string(" ")); continue; }
+			for (char c : text) {
+				if (std::isspace(static_cast<unsigned char>(c))) whitespace = true;
+				else { if (whitespace && !out.empty()) out.push_back(' '); out.push_back(c); whitespace = false; }
+			}
+			if (whitespace && !out.empty()) out.push_back(' ');
+			token.set_text(std::move(out));
+		}
+	}
+}
+
+std::vector<Token> tokenize_region(std::string_view text, Language lang) {
+	if (lang == Language::Java) return tokenize_cpp(text, {}, true);
+	if (lang == Language::Xml) return tokenize_xml(text, {});
+	return tokenize_web(text, lang);
+}
+
+void transform_token_regions(std::vector<Token> &tokens, Language lang, const std::function<void(std::string &)> &transform) {
+	std::vector<Token> result;
+	result.reserve(tokens.size());
+	std::string region;
+	auto flush = [&]() {
+		if (region.empty()) return;
+		transform(region);
+		auto generated = tokenize_region(region, lang);
+		for (auto &token : generated) token.set_text(std::string(token.text()));
+		result.insert(result.end(), std::make_move_iterator(generated.begin()), std::make_move_iterator(generated.end()));
+		region.clear();
+	};
+	for (auto &token : tokens) {
+		if (token.excluded) {
+			flush();
+			result.push_back(std::move(token));
+		} else region.append(token.text());
+	}
+	flush();
+	tokens = std::move(result);
+}
+
+void transform_html_embedded(std::vector<Token> &tokens, const Options &opt) {
+	std::vector<Token> result;
+	result.reserve(tokens.size());
+	Language active = Language::Plain;
+	std::string region;
+	auto flush = [&]() {
+		if (region.empty() || active == Language::Plain) return;
+		if (active == Language::JavaScript) transform_js_php(region, active, opt);
+		else {
+			auto css = tokenize_web(region, Language::Css);
+			transform_css(css, opt);
+			region.clear();
+			for (const auto &token : css) region.append(token.text());
+		}
+		auto generated = tokenize_web(region, active);
+		for (auto &token : generated) token.set_text(std::string(token.text()));
+		result.insert(result.end(), std::make_move_iterator(generated.begin()), std::make_move_iterator(generated.end()));
+		region.clear();
+	};
+	for (auto &token : tokens) {
+		if (token.type == TokenType::XmlTag) {
+			flush();
+			std::string tag(token.text());
+			std::transform(tag.begin(), tag.end(), tag.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			const bool closing = tag.starts_with("</");
+			if (closing && ((active == Language::JavaScript && tag.starts_with("</script")) || (active == Language::Css && tag.starts_with("</style")))) active = Language::Plain;
+			result.push_back(std::move(token));
+			if (!closing && tag.starts_with("<script") && (tag.size() == 7 || std::isspace(static_cast<unsigned char>(tag[7])) || tag[7] == '>')) active = Language::JavaScript;
+			else if (!closing && tag.starts_with("<style") && (tag.size() == 6 || std::isspace(static_cast<unsigned char>(tag[6])) || tag[6] == '>')) active = Language::Css;
+		} else if (active != Language::Plain && !token.excluded) region.append(token.text());
+		else {
+			flush();
+			result.push_back(std::move(token));
+		}
+	}
+	flush();
+	tokens = std::move(result);
 }
 
 std::vector<Token> tokenize_python(std::string_view src, std::span<const size_t> excluded_lines) {
@@ -665,7 +1363,260 @@ std::string clean_whitespace(std::string_view src, BlankLineMode mode, IndentMod
 	return out;
 }
 
+namespace {
+
+std::string line_error(std::string_view message, size_t line) {
+	return std::string(message) + " w linii " + std::to_string(line);
+}
+
+std::pair<bool, std::string> verify_delimited_syntax(std::string_view code, Language lang) {
+	std::vector<std::pair<char, size_t>> stack;
+	const bool java = lang == Language::Java;
+	const bool js = lang == Language::JavaScript;
+	const bool php = lang == Language::Php;
+	size_t line = 1;
+	for (size_t i = 0; i < code.size();) {
+		const char c = code[i];
+		if (c == '\n') { ++line; ++i; continue; }
+		if (c == '/' && i + 1 < code.size() && code[i + 1] == '*') {
+			const size_t startLine = line;
+			i += 2;
+			bool closed = false;
+			while (i < code.size()) {
+				if (code[i] == '\n') ++line;
+				if (code[i] == '*' && i + 1 < code.size() && code[i + 1] == '/') { i += 2; closed = true; break; }
+				++i;
+			}
+			if (!closed) return {false, line_error("Niedomknięty komentarz blokowy otwarty", startLine)};
+			continue;
+		}
+		if ((js || java || php) && c == '/' && i + 1 < code.size() && code[i + 1] == '/') {
+			while (i < code.size() && code[i] != '\n') ++i;
+			continue;
+		}
+		if (php && c == '#') { while (i < code.size() && code[i] != '\n') ++i; continue; }
+		if (java && code.substr(i, 3) == "\"\"\"") {
+			const size_t startLine = line;
+			i += 3;
+			const size_t end = code.find("\"\"\"", i);
+			if (end == std::string_view::npos) return {false, line_error("Niedomknięty text-block Java otwarty", startLine)};
+			for (; i < end + 3; ++i) if (code[i] == '\n') ++line;
+			continue;
+		}
+		if (c == '\'' || c == '"' || (js && c == '`')) {
+			const char quote = c;
+			const size_t startLine = line;
+			++i;
+			bool closed = false;
+			while (i < code.size()) {
+				if (code[i] == '\n') { ++line; if (quote != '`' && !php) break; }
+				if (code[i] == '\\' && i + 1 < code.size()) { if (code[i + 1] == '\n') ++line; i += 2; continue; }
+				if (code[i++] == quote) { closed = true; break; }
+			}
+			if (!closed) return {false, line_error("Niedomknięty literał otwarty", startLine)};
+			continue;
+		}
+		bool regexStart = false;
+		if (js && c == '/') {
+			size_t previous = i;
+			while (previous > 0 && std::isspace(static_cast<unsigned char>(code[previous - 1]))) --previous;
+			if (previous == 0 || std::string_view("=(:,[!&|?{};>").find(code[previous - 1]) != std::string_view::npos) regexStart = true;
+			else if (previous > 0 && is_ident(code[previous - 1])) {
+				size_t begin = previous - 1;
+				while (begin > 0 && is_ident(code[begin - 1])) --begin;
+				const std::string_view word = code.substr(begin, previous - begin);
+				regexStart = word == "return" || word == "throw" || word == "case" || word == "delete" || word == "typeof" || word == "void" || word == "yield" || word == "await" || word == "else";
+			}
+		}
+		if (js && c == '/' && regexStart) {
+			const size_t startLine = line;
+			++i;
+			bool inClass = false, closed = false;
+			while (i < code.size() && code[i] != '\n') {
+				if (code[i] == '\\' && i + 1 < code.size()) { i += 2; continue; }
+				if (code[i] == '[') inClass = true;
+				else if (code[i] == ']') inClass = false;
+				else if (code[i] == '/' && !inClass) { ++i; closed = true; while (i < code.size() && std::isalpha(static_cast<unsigned char>(code[i]))) ++i; break; }
+				++i;
+			}
+			if (!closed) return {false, line_error("Niedomknięty regex JavaScript otwarty", startLine)};
+			continue;
+		}
+		if (php && code.substr(i, 3) == "<<<") {
+			const size_t startLine = line;
+			size_t p = i + 3;
+			while (p < code.size() && (code[p] == ' ' || code[p] == '\t')) ++p;
+			char quote = '\0';
+			if (p < code.size() && (code[p] == '\'' || code[p] == '"')) quote = code[p++];
+			const size_t nameStart = p;
+			while (p < code.size() && (std::isalnum(static_cast<unsigned char>(code[p])) || code[p] == '_')) ++p;
+			if (p > nameStart) {
+				std::string label(code.substr(nameStart, p - nameStart));
+				if (quote && p < code.size() && code[p] == quote) ++p;
+				while (p < code.size() && code[p] != '\n') ++p;
+				if (p < code.size()) ++p;
+				bool closed = false;
+				while (p < code.size()) {
+					size_t q = p;
+					while (q < code.size() && (code[q] == ' ' || code[q] == '\t')) ++q;
+					if (code.substr(q, label.size()) == label && (q + label.size() == code.size() || code[q + label.size()] == ';' || code[q + label.size()] == '\n' || code[q + label.size()] == '\r')) { p = q + label.size(); closed = true; break; }
+					while (p < code.size() && code[p++] != '\n') {}
+				}
+				if (!closed) return {false, line_error("Niedomknięty heredoc/nowdoc otwarty", startLine)};
+				for (; i < p; ++i) if (code[i] == '\n') ++line;
+				continue;
+			}
+		}
+		if (c == '{' || c == '(' || c == '[') stack.emplace_back(c, line);
+		else if (c == '}' || c == ')' || c == ']') {
+			if (stack.empty()) return {false, line_error("Nieoczekiwany znak domykający", line)};
+			const char open = stack.back().first;
+			if ((c == '}' && open != '{') || (c == ')' && open != '(') || (c == ']' && open != '[')) return {false, line_error("Niezgodny delimiter; otwarcie w linii " + std::to_string(stack.back().second), line)};
+			stack.pop_back();
+		}
+		++i;
+	}
+	if (!stack.empty()) return {false, line_error(std::string("Niedomknięty delimiter '") + stack.back().first + "' otwarty", stack.back().second)};
+	return {true, {}};
+}
+
+std::pair<bool, std::string> verify_markup_syntax(std::string_view code, bool html) {
+	struct OpenTag { std::string name; size_t line; };
+	std::vector<OpenTag> stack;
+	static const std::array<std::string_view, 14> voidTags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
+	size_t line = 1;
+	for (size_t i = 0; i < code.size();) {
+		if (code[i] == '\n') { ++line; ++i; continue; }
+		if (html && !stack.empty() && (stack.back().name == "script" || stack.back().name == "style")) {
+			const std::string needle = "</" + stack.back().name;
+			size_t end = i;
+			for (; end + needle.size() <= code.size(); ++end) {
+				bool match = true;
+				for (size_t j = 0; j < needle.size(); ++j) if (std::tolower(static_cast<unsigned char>(code[end + j])) != needle[j]) { match = false; break; }
+				if (match && end + needle.size() < code.size() && !std::isspace(static_cast<unsigned char>(code[end + needle.size()])) && code[end + needle.size()] != '>') match = false;
+				if (match) break;
+			}
+			for (; i < end; ++i) if (code[i] == '\n') ++line;
+			if (end == code.size()) break;
+		}
+		if (code.substr(i, 4) == "<!--") {
+			const size_t startLine = line, end = code.find("-->", i + 4);
+			if (end == std::string_view::npos) return {false, line_error("Niedomknięty komentarz", startLine)};
+			for (; i < end + 3; ++i) if (code[i] == '\n') ++line;
+			continue;
+		}
+		if (code.substr(i, 9) == "<![CDATA[") {
+			const size_t end = code.find("]]>", i + 9);
+			if (end == std::string_view::npos) return {false, line_error("Niedomknięty blok CDATA", line)};
+			for (; i < end + 3; ++i) if (code[i] == '\n') ++line;
+			continue;
+		}
+		if (code[i] != '<') { ++i; continue; }
+		const size_t tagLine = line;
+		if (i + 1 < code.size() && (code[i + 1] == '?' || code[i + 1] == '!')) {
+			size_t end = i + 2;
+			char quote = '\0';
+			for (; end < code.size(); ++end) {
+				if (quote) { if (code[end] == quote) quote = '\0'; }
+				else if (code[end] == '\'' || code[end] == '"') quote = code[end];
+				else if (code[end] == '>' && !(code[i + 1] == '?' && end > i && code[end - 1] != '?')) break;
+			}
+			if (end == code.size()) return {false, line_error("Niedomknięta deklaracja/tag", tagLine)};
+			for (; i <= end; ++i) if (code[i] == '\n') ++line;
+			continue;
+		}
+		size_t end = i + 1;
+		char quote = '\0';
+		for (; end < code.size(); ++end) {
+			if (quote) { if (code[end] == quote) quote = '\0'; }
+			else if (code[end] == '\'' || code[end] == '"') quote = code[end];
+			else if (code[end] == '>') break;
+		}
+		if (end == code.size()) return {false, line_error(quote ? "Niedomknięty cudzysłów atrybutu" : "Niedomknięty tag", tagLine)};
+		std::string_view inside = code.substr(i + 1, end - i - 1);
+		bool closing = !inside.empty() && inside.front() == '/';
+		if (closing) inside.remove_prefix(1);
+		while (!inside.empty() && std::isspace(static_cast<unsigned char>(inside.front()))) inside.remove_prefix(1);
+		size_t nameEnd = 0;
+		while (nameEnd < inside.size() && !std::isspace(static_cast<unsigned char>(inside[nameEnd])) && inside[nameEnd] != '/') ++nameEnd;
+		if (nameEnd == 0) return {false, line_error("Niepoprawny tag", tagLine)};
+		std::string name(inside.substr(0, nameEnd));
+		if (html) std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		bool selfClosing = end > i + 1 && code[end - 1] == '/';
+		if (closing) {
+			if (stack.empty() || stack.back().name != name) {
+				const std::string expected = stack.empty() ? "brak" : "</" + stack.back().name + ">";
+				return {false, line_error("Oczekiwano " + expected + ", napotkano </" + name + ">", tagLine)};
+			}
+			stack.pop_back();
+		} else if (!selfClosing) {
+			const bool isVoid = html && std::find(voidTags.begin(), voidTags.end(), name) != voidTags.end();
+			if (!isVoid) stack.push_back({std::move(name), tagLine});
+		}
+		for (; i <= end; ++i) if (code[i] == '\n') ++line;
+	}
+	if (!stack.empty()) return {false, line_error("Nie zamknięto tagu <" + stack.back().name + "> otwartego", stack.back().line)};
+	return {true, {}};
+}
+
+std::pair<bool, std::string> verify_external(std::string_view code, const char *program, const char *arg, const char *arg2 = nullptr) {
+	int input[2] = {-1, -1}, errors[2] = {-1, -1};
+	if (pipe(input) < 0) return {false, "pipe() failed: " + std::string(std::strerror(errno))};
+	if (pipe(errors) < 0) { close(input[0]); close(input[1]); return {false, "pipe() failed: " + std::string(std::strerror(errno))}; }
+	const pid_t pid = fork();
+	if (pid < 0) { close(input[0]); close(input[1]); close(errors[0]); close(errors[1]); return {false, "fork() failed: " + std::string(std::strerror(errno))}; }
+	if (pid == 0) {
+		close(input[1]); close(errors[0]);
+		if (dup2(input[0], STDIN_FILENO) < 0 || dup2(errors[1], STDOUT_FILENO) < 0 || dup2(errors[1], STDERR_FILENO) < 0) _exit(126);
+		close(input[0]); close(errors[1]);
+		if (arg2) execlp(program, program, arg, arg2, nullptr);
+		else execlp(program, program, arg, nullptr);
+		_exit(errno == ENOENT ? 127 : 126);
+	}
+	close(input[0]); close(errors[1]);
+	sigset_t pipeSet, oldSet;
+	sigemptyset(&pipeSet); sigaddset(&pipeSet, SIGPIPE);
+	pthread_sigmask(SIG_BLOCK, &pipeSet, &oldSet);
+	size_t written = 0;
+	while (written < code.size()) {
+		const ssize_t n = write(input[1], code.data() + written, code.size() - written);
+		if (n > 0) written += static_cast<size_t>(n);
+		else if (n < 0 && errno == EINTR) continue;
+		else break;
+	}
+	close(input[1]);
+	sigset_t pending;
+	sigpending(&pending);
+	if (sigismember(&pending, SIGPIPE)) { timespec zero{0, 0}; sigtimedwait(&pipeSet, nullptr, &zero); }
+	std::string err;
+	std::array<char, 512> buffer{};
+	for (;;) {
+		const ssize_t n = read(errors[0], buffer.data(), buffer.size());
+		if (n > 0) err.append(buffer.data(), static_cast<size_t>(n));
+		else if (n < 0 && errno == EINTR) continue;
+		else break;
+	}
+	close(errors[0]);
+	pthread_sigmask(SIG_SETMASK, &oldSet, nullptr);
+	int status = 0;
+	pid_t waited;
+	do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+	if (waited < 0) return {false, "waitpid() failed: " + std::string(std::strerror(errno))};
+	if (WIFEXITED(status) && (WEXITSTATUS(status) == 127 || WEXITSTATUS(status) == 126)) return {true, "__fallback__"};
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return {true, {}};
+	return {false, err.empty() ? "Walidator zewnętrzny zakończył się błędem" : err};
+}
+
+} // namespace
+
 std::pair<bool, std::string> verify_syntax_posix(std::string_view code, Language lang) {
+	if (lang == Language::Java || lang == Language::Css || lang == Language::JavaScript || lang == Language::Php) {
+		if (lang == Language::Java || lang == Language::Css) return verify_delimited_syntax(code, lang);
+		auto external = lang == Language::JavaScript ? verify_external(code, "node", "--check", "-") : verify_external(code, "php", "-l");
+		if (external.second != "__fallback__") return external;
+		return verify_delimited_syntax(code, lang);
+	}
+	if (lang == Language::Xml || lang == Language::Html) return verify_markup_syntax(code, lang == Language::Html);
 	if (lang == Language::Python) {
 		int in_pipe[2], err_pipe[2];
 		if (pipe(in_pipe) < 0 || pipe(err_pipe) < 0) return {false, "pipe() failed"};
@@ -1544,14 +2495,32 @@ Result process(std::string_view src, const Options& opt) {
 	if (lang == Language::Auto) lang = Language::Cpp;
 	std::vector<Token> tokens;
 	if (lang == Language::Cpp) tokens = tokenize_cpp(src, opt.excluded_lines);
+	else if (lang == Language::Java) tokens = tokenize_cpp(src, opt.excluded_lines, true);
+	else if (lang == Language::Xml) tokens = tokenize_xml(src, opt.excluded_lines);
+	else if (lang == Language::JavaScript || lang == Language::Css || lang == Language::Php) {
+		tokens = tokenize_web(src, lang);
+		split_excluded_code_lines(tokens, opt.excluded_lines);
+	} else if (lang == Language::Html) {
+		tokens = tokenize_html(src);
+		split_excluded_code_lines(tokens, opt.excluded_lines);
+	}
 	else if (lang == Language::Python) tokens = tokenize_python(src, opt.excluded_lines);
 	else if (lang == Language::Shell) tokens = tokenize_shell(src, opt.excluded_lines);
 	else { tokens.push_back({TokenType::Code, src, {}, false}); split_excluded_code_lines(tokens, opt.excluded_lines); }
 	if (lang == Language::Cpp) apply_cpp_transforms(tokens, opt);
 	else if (lang == Language::Python) apply_python_transforms(tokens, opt);
+	else if (lang == Language::Java) transform_token_regions(tokens, lang, [&](std::string &region) { transform_java(region, opt); });
+	else if (lang == Language::JavaScript || lang == Language::Php) transform_token_regions(tokens, lang, [&](std::string &region) { transform_js_php(region, lang, opt); });
+	else if (lang == Language::Xml) transform_token_regions(tokens, lang, [&](std::string &region) { transform_xml(region, opt); });
+	else if (lang == Language::Css) transform_css(tokens, opt);
+	else if (lang == Language::Html) {
+		transform_html_embedded(tokens, opt);
+		transform_html(tokens, opt.collapse_html_whitespace);
+	}
 	if (!opt.custom_rules.empty()) {
 		for (auto& t : tokens) {
-			if (t.excluded || t.type != TokenType::Code || t.empty()) continue;
+			const bool markup = lang == Language::Xml || lang == Language::Html;
+			if (t.excluded || (t.type != TokenType::Code && !(markup && t.type == TokenType::XmlTag)) || t.empty()) continue;
 			std::string s(t.text());
 			bool changed = false;
 			for (const auto& r : opt.custom_rules) if (r.compiled_re && r.compiled_re->ok()) changed |= re2::RE2::GlobalReplace(&s, *r.compiled_re, r.replace);
@@ -1599,9 +2568,25 @@ Result process(std::string_view src, const Options& opt) {
 			}
 			continue;
 		}
+		const bool webLanguage = lang == Language::JavaScript || lang == Language::Css || lang == Language::Php;
+		const bool protectedHtmlLiteral = lang == Language::Html && (t.type == TokenType::String || t.type == TokenType::Regex || t.type == TokenType::Template || t.type == TokenType::HereDoc);
+		if ((webLanguage && t.type != TokenType::Code) || protectedHtmlLiteral) {
+			flush_before_protected();
+			preserved_output.append(t.text());
+			last_blank = false;
+			continue;
+		}
 		intermediate.append(t.text());
 	}
-	if (opt.excluded_lines.empty()) res.output = clean_whitespace(intermediate, opt.blank_mode, opt.indent_mode, opt.tab_size);
+	const bool protectedWeb = lang == Language::JavaScript || lang == Language::Css || lang == Language::Php;
+	if (protectedWeb) {
+		if (!intermediate.empty()) {
+			if (intermediate.back() == '\n') clean_whitespace_append(intermediate, opt.blank_mode, opt.indent_mode, opt.tab_size, preserved_output, last_blank, &brace_depth);
+			else preserved_output += intermediate;
+		}
+		res.output = std::move(preserved_output);
+	}
+	else if (opt.excluded_lines.empty()) res.output = clean_whitespace(intermediate, opt.blank_mode, opt.indent_mode, opt.tab_size);
 	else { if (!intermediate.empty()) clean_whitespace_append(intermediate, opt.blank_mode, opt.indent_mode, opt.tab_size, preserved_output, last_blank, &brace_depth); res.output = std::move(preserved_output); }
 	res.out_bytes = res.output.size();
 	res.out_lines = count_lines(res.output);

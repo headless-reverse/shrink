@@ -33,7 +33,16 @@ struct BatchSummary {
 	int totalCount = 0;
 	quint64 totalInBytes = 0;
 	quint64 totalOutBytes = 0;
+	quint64 totalInLines = 0;
+	quint64 totalOutLines = 0;
 };
+
+struct BundleResult {
+	QString markdown;
+	BatchSummary metrics;
+};
+
+Q_DECLARE_METATYPE(BundleResult)
 
 class ShrinkController : public QObject {
 	Q_OBJECT
@@ -72,7 +81,7 @@ signals:
 	void batchStarted();
 	void batchItemFinished(int index, bool success, quint64 inBytes, quint64 outBytes, const QString &errorMsg);
 	void batchFinished(int processedCount, int totalCount, quint64 totalInBytes, quint64 totalOutBytes);
-	void llmBundleGenerated(const QString &bundleMarkdown);
+	void llmBundleGenerated(const BundleResult &result);
 	void rulesLoaded(int ruleCount);
 	void statusMessage(const QString &message, bool isError = false);
 	void queueChanged(int totalItems);
@@ -88,7 +97,7 @@ private:
 	std::atomic<bool> m_cancelRequested{false};
 	QFutureWatcher<shrink::Result> m_singleWatcher;
 	QFutureWatcher<BatchSummary> m_batchWatcher;
-	QFutureWatcher<QString> m_bundleWatcher;
+	QFutureWatcher<BundleResult> m_bundleWatcher;
 	void scanDirectoryRecursive(const std::filesystem::path &root);
 	static shrink::Language detectLanguage(const std::filesystem::path &p) noexcept;
 	static QString languageToFence(shrink::Language l) noexcept;

@@ -26,129 +26,6 @@ constexpr size_t hardware_destructive_interference_size = 64;
 
 constexpr size_t BATCH_CHUNK = 16;
 
-struct GitIgnoreRule {
-	std::string pattern;
-	bool is_negation = false;
-	bool dir_only = false;
-	bool anchored = false;
-};
-
-bool glob_match(std::string_view pat, std::string_view str) noexcept {
-	if (pat.empty()) return str.empty();
-	if (pat == "*") return true;
-
-	if (pat.starts_with("**/")) {
-		std::string_view rest = pat.substr(3);
-		if (glob_match(rest, str)) return true;
-		for (size_t i = 0; i < str.size(); ++i) {
-			if (str[i] == '/' && glob_match(pat, str.substr(i + 1))) return true;
-		}
-		return false;
-	}
-
-	size_t p = 0, s = 0;
-	size_t star_p = std::string_view::npos, star_s = 0;
-
-	while (s < str.size()) {
-		if (p < pat.size() && (pat[p] == str[s] || (pat[p] == '?' && str[s] != '/'))) {
-			++p;
-			++s;
-		} else if (p < pat.size() && pat[p] == '*') {
-			star_p = p++;
-			star_s = s;
-		} else if (star_p != std::string_view::npos) {
-			if (str[star_s] == '/') return false;
-			p = star_p + 1;
-			s = ++star_s;
-		} else {
-			return false;
-		}
-	}
-
-	while (p < pat.size() && pat[p] == '*') ++p;
-	return p == pat.size();
-}
-
-class GitIgnoreEngine {
-	std::vector<GitIgnoreRule> rules;
-
-public:
-	void add_rule(std::string_view raw) {
-		while (!raw.empty() && (raw.front() == ' ' || raw.front() == '\t')) raw.remove_prefix(1);
-		while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '\r' || raw.back() == '\n')) raw.remove_suffix(1);
-		if (raw.empty() || raw.front() == '#') return;
-
-		GitIgnoreRule r;
-		if (raw.front() == '!') {
-			r.is_negation = true;
-			raw.remove_prefix(1);
-		}
-
-		if (raw.ends_with('/')) {
-			r.dir_only = true;
-			raw.remove_suffix(1);
-		}
-
-		if (raw.front() == '/') {
-			r.anchored = true;
-			raw.remove_prefix(1);
-		} else if (raw.find('/') == std::string_view::npos) {
-			r.anchored = false;
-		} else {
-			r.anchored = true;
-		}
-
-		r.pattern = std::string(raw);
-		rules.push_back(std::move(r));
-	}
-
-	void load_file(const fs::path& path) {
-		int fd = ::open(path.c_str(), O_RDONLY);
-		if (fd < 0) return;
-		struct stat st;
-		if (::fstat(fd, &st) < 0 || st.st_size == 0) {
-			::close(fd);
-			return;
-		}
-		std::string content(static_cast<size_t>(st.st_size), '\0');
-		ssize_t read_bytes = ::read(fd, content.data(), content.size());
-		::close(fd);
-		if (read_bytes <= 0) return;
-
-		size_t pos = 0;
-		while (pos < content.size()) {
-			size_t end = content.find('\n', pos);
-			if (end == std::string::npos) end = content.size();
-			add_rule(std::string_view(content.data() + pos, end - pos));
-			pos = end + 1;
-		}
-	}
-
-	bool is_ignored(std::string_view rel_path, bool is_dir) const noexcept {
-		if (rel_path == ".git" || rel_path.starts_with(".git/")) return true;
-
-		std::string_view basename = rel_path;
-		size_t slash = rel_path.rfind('/');
-		if (slash != std::string_view::npos) basename = rel_path.substr(slash + 1);
-
-		bool ignored = false;
-		for (const auto& r : rules) {
-			if (r.dir_only && !is_dir) continue;
-			bool match = false;
-			if (r.anchored) {
-				match = glob_match(r.pattern, rel_path);
-			} else {
-				match = glob_match(r.pattern, basename) || glob_match(r.pattern, rel_path);
-			}
-
-			if (match) {
-				ignored = !r.is_negation;
-			}
-		}
-		return ignored;
-	}
-};
-
 struct MappedFile {
 	int fd = -1;
 	void* data = MAP_FAILED;
@@ -255,6 +132,12 @@ shrink::Language detect_lang(const fs::path& p) noexcept {
 	if (ext == ".cpp" || ext == ".hpp" || ext == ".cc" || ext == ".c" || ext == ".h") return shrink::Language::Cpp;
 	if (ext == ".py") return shrink::Language::Python;
 	if (ext == ".sh" || ext == ".bash") return shrink::Language::Shell;
+	if (ext == ".java") return shrink::Language::Java;
+	if (ext == ".xml" || ext == ".xhtml" || ext == ".pom") return shrink::Language::Xml;
+	if (ext == ".js" || ext == ".mjs" || ext == ".cjs") return shrink::Language::JavaScript;
+	if (ext == ".css") return shrink::Language::Css;
+	if (ext == ".html" || ext == ".htm") return shrink::Language::Html;
+	if (ext == ".php" || ext == ".phtml") return shrink::Language::Php;
 	return shrink::Language::Plain;
 }
 
@@ -263,6 +146,12 @@ std::string_view lang_to_fence(shrink::Language l) noexcept {
 		case shrink::Language::Cpp: return "cpp";
 		case shrink::Language::Python: return "python";
 		case shrink::Language::Shell: return "bash";
+		case shrink::Language::Java: return "java";
+		case shrink::Language::Xml: return "xml";
+		case shrink::Language::JavaScript: return "javascript";
+		case shrink::Language::Css: return "css";
+		case shrink::Language::Html: return "html";
+		case shrink::Language::Php: return "php";
 		case shrink::Language::Plain: return "text";
 		default: return "text";
 	}
@@ -401,6 +290,12 @@ int main(int argc, char* argv[]) {
 				if (l == "cpp") opt.lang = shrink::Language::Cpp;
 				else if (l == "python") opt.lang = shrink::Language::Python;
 				else if (l == "shell") opt.lang = shrink::Language::Shell;
+				else if (l == "java") opt.lang = shrink::Language::Java;
+				else if (l == "xml") opt.lang = shrink::Language::Xml;
+				else if (l == "javascript" || l == "js") opt.lang = shrink::Language::JavaScript;
+				else if (l == "css") opt.lang = shrink::Language::Css;
+				else if (l == "html") opt.lang = shrink::Language::Html;
+				else if (l == "php") opt.lang = shrink::Language::Php;
 				else opt.lang = shrink::Language::Plain;
 			}
 		}
@@ -447,7 +342,7 @@ int main(int argc, char* argv[]) {
 	if (recursive || bundle_mode) {
 		if (input_path.empty()) input_path = ".";
 		fs::path root_path = fs::canonical(input_path);
-		GitIgnoreEngine gitignore;
+		shrink::GitIgnoreEngine gitignore;
 		fs::path gitignore_path = root_path / ".gitignore";
 		if (fs::exists(gitignore_path)) {
 			gitignore.load_file(gitignore_path);

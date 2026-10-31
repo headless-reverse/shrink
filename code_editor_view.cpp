@@ -153,7 +153,6 @@ void computeLinearDiff(const QStringList &src, const QStringList &dst,
 			}
 
 			int y = x - k;
-			int nodeIdx = static_cast<int>(trace.size());
 			trace.push_back({x, y, (d == 0) ? -1 : prevKIdx});
 
 			while (x < n && y < m && src[x] == dst[y]) {

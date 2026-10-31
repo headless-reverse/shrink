@@ -18,7 +18,13 @@ enum class Language {
 	Cpp,
 	Python,
 	Shell,
-	Plain
+	Plain,
+	Java,
+	Xml,
+	JavaScript,
+	Css,
+	Html,
+	Php
 };
 
 enum class BlankLineMode {
@@ -36,7 +42,10 @@ enum class TokenType {
 	Comment,
 	Docstring,
 	Preprocessor,
-	HereDoc
+	HereDoc,
+	XmlTag,
+	Regex,
+	Template
 };
 
 enum class IndentMode {
@@ -64,6 +73,13 @@ struct Options {
 	bool skeleton_public_only = false;
 	bool modernize_guards = false;
 	bool strip_attributes = false;
+	bool strip_annotations = false;
+	bool strip_unused_imports = false;
+	bool collapse_tags_whitespace = false;
+	bool collapse_empty_tags = false;
+	bool compact_arrow_functions = false;
+	bool compact_css_rules = false;
+	bool collapse_html_whitespace = false;
 	bool strip_redundant = false;
 	bool modernize_namespaces = false;
 	bool compact_types = false;

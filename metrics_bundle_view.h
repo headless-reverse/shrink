@@ -7,6 +7,7 @@
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
+struct BundleResult;
 
 class MetricsBundleView : public QDockWidget {
 	Q_OBJECT
@@ -17,7 +18,7 @@ public:
 public slots:
 	void onTransformFinished(const shrink::Result &result);
 	void onBatchFinished(int processedCount, int totalCount, quint64 totalInBytes, quint64 totalOutBytes);
-	void onLlmBundleGenerated(const QString &bundleMarkdown);
+	void onLlmBundleGenerated(const BundleResult &result);
 
 signals:
 	void generateBundleRequested();

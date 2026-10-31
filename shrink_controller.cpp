@@ -4,6 +4,7 @@
 #include <QtConcurrent/QtConcurrent>
 #include <QThreadPool>
 #include <QCryptographicHash>
+#include <QByteArrayView>
 #include <QDataStream>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -13,6 +14,7 @@
 #include <set>
 #include <cctype>
 #include <latch>
+#include <thread>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -41,6 +43,7 @@ bool write_all_bytes(const fs::path &path, std::string_view content) noexcept {
 
 ShrinkController::ShrinkController(QObject *parent) : QObject(parent) {
 	qRegisterMetaType<shrink::Result>("shrink::Result");
+	qRegisterMetaType<BundleResult>("BundleResult");
 	connect(&m_singleWatcher, &QFutureWatcher<shrink::Result>::finished, this, [this]() {
 		m_isBusy.store(false, std::memory_order_release);
 		shrink::Result res = m_singleWatcher.result();
@@ -53,7 +56,7 @@ ShrinkController::ShrinkController(QObject *parent) : QObject(parent) {
 		emit batchFinished(s.processedCount, s.totalCount, s.totalInBytes, s.totalOutBytes);
 		emit statusMessage(m_cancelRequested.load(std::memory_order_relaxed) ? QStringLiteral("Przetwarzanie wsadowe przerwane") : QStringLiteral("Zakończono przetwarzanie wsadowe"), false);
 	});
-	connect(&m_bundleWatcher, &QFutureWatcher<QString>::finished, this, [this]() {
+	connect(&m_bundleWatcher, &QFutureWatcher<BundleResult>::finished, this, [this]() {
 		m_isBusy.store(false, std::memory_order_release);
 		emit llmBundleGenerated(m_bundleWatcher.result());
 		emit statusMessage(QStringLiteral("Wygenerowano LLM Context Bundle"), false);
@@ -70,14 +73,14 @@ ShrinkController::~ShrinkController() {
 QByteArray ShrinkController::computeOptionsSignature(const shrink::Options &opt) {
 	QByteArray bytes;
 	QDataStream stream(&bytes, QIODevice::WriteOnly);
-	stream << static_cast<qint32>(opt.lang) << opt.strip_comments << static_cast<qint32>(opt.blank_mode) << static_cast<qint32>(opt.indent_mode) << static_cast<qint32>(opt.tab_size) << opt.extract_skeleton << opt.skeleton_public_only << opt.modernize_guards << opt.strip_attributes << opt.strip_redundant << opt.modernize_namespaces << opt.compact_types << opt.compact_constructors << opt.if_to_ternary << opt.bpe_compress << opt.strip_debug << opt.strip_docstrings << opt.strip_types << opt.preserve_shebang << opt.verify_syntax << opt.unwrap_parentheses << opt.compact_short_functions;
+	stream << static_cast<qint32>(opt.lang) << opt.strip_comments << static_cast<qint32>(opt.blank_mode) << static_cast<qint32>(opt.indent_mode) << static_cast<qint32>(opt.tab_size) << opt.extract_skeleton << opt.skeleton_public_only << opt.modernize_guards << opt.strip_attributes << opt.strip_annotations << opt.strip_unused_imports << opt.collapse_tags_whitespace << opt.collapse_empty_tags << opt.compact_arrow_functions << opt.compact_css_rules << opt.collapse_html_whitespace << opt.strip_redundant << opt.modernize_namespaces << opt.compact_types << opt.compact_constructors << opt.if_to_ternary << opt.bpe_compress << opt.strip_debug << opt.strip_docstrings << opt.strip_types << opt.preserve_shebang << opt.verify_syntax << opt.unwrap_parentheses << opt.compact_short_functions;
 	for (const auto &rule : opt.custom_rules) stream << QString::fromStdString(rule.name) << QString::fromStdString(rule.regex_str) << QString::fromStdString(rule.replace);
 	return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
 }
 
 QString ShrinkController::computeFileHash(std::string_view content, const QByteArray &optionsSig) {
 	QCryptographicHash hash(QCryptographicHash::Sha256);
-	hash.addData(content.data(), static_cast<qsizetype>(content.size()));
+	hash.addData(QByteArrayView(content.data(), content.size()));
 	hash.addData(optionsSig);
 	return QString::fromLatin1(hash.result().toHex());
 }
@@ -87,6 +90,12 @@ shrink::Language ShrinkController::detectLanguage(const fs::path &p) noexcept {
 	if (ext == ".cpp" || ext == ".hpp" || ext == ".cc" || ext == ".c" || ext == ".h") return shrink::Language::Cpp;
 	if (ext == ".py") return shrink::Language::Python;
 	if (ext == ".sh" || ext == ".bash") return shrink::Language::Shell;
+	if (ext == ".java") return shrink::Language::Java;
+	if (ext == ".xml" || ext == ".xhtml" || ext == ".pom") return shrink::Language::Xml;
+	if (ext == ".js" || ext == ".mjs" || ext == ".cjs") return shrink::Language::JavaScript;
+	if (ext == ".css") return shrink::Language::Css;
+	if (ext == ".html" || ext == ".htm") return shrink::Language::Html;
+	if (ext == ".php" || ext == ".phtml") return shrink::Language::Php;
 	return shrink::Language::Plain;
 }
 
@@ -95,6 +104,12 @@ QString ShrinkController::languageToFence(shrink::Language l) noexcept {
 	case shrink::Language::Cpp: return QStringLiteral("cpp");
 	case shrink::Language::Python: return QStringLiteral("python");
 	case shrink::Language::Shell: return QStringLiteral("bash");
+	case shrink::Language::Java: return QStringLiteral("java");
+	case shrink::Language::Xml: return QStringLiteral("xml");
+	case shrink::Language::JavaScript: return QStringLiteral("javascript");
+	case shrink::Language::Css: return QStringLiteral("css");
+	case shrink::Language::Html: return QStringLiteral("html");
+	case shrink::Language::Php: return QStringLiteral("php");
 	default: return QStringLiteral("text");
 	}
 }
@@ -403,19 +418,64 @@ void ShrinkController::runBatchQueue(const QString &outputDir, unsigned int thre
 void ShrinkController::generateLlmBundle() {
 	if (m_isBusy.load(std::memory_order_relaxed)) return;
 	std::vector<BatchQueueItem> localQueue;
+	auto emitEmptyBundle = [this]() {
+		BundleResult result;
+		result.markdown = QStringLiteral("# LLM Context Bundle\n\nBrak plików w kolejce.\n");
+		emit llmBundleGenerated(result);
+	};
 	{
 		std::lock_guard<std::mutex> lock(m_queueMutex);
-		if (m_queue.empty()) { emit llmBundleGenerated(QStringLiteral("# LLM Context Bundle\n\nBrak plików w kolejce.\n")); return; }
+		if (m_queue.empty()) { emitEmptyBundle(); return; }
 		for (const auto &item : m_queue) if (!item.excluded) localQueue.push_back(item);
 	}
 	if (localQueue.empty()) {
-		emit llmBundleGenerated(QStringLiteral("# LLM Context Bundle\n\nBrak plików w kolejce.\n"));
+		emitEmptyBundle();
 		return;
 	}
 	m_isBusy.store(true, std::memory_order_release);
 	emit statusMessage(QStringLiteral("Generowanie LLM Context Bundle..."), false);
 	const shrink::Options optCopy = options();
 	m_bundleWatcher.setFuture(QtConcurrent::run([this, q = std::move(localQueue), optCopy]() {
+		struct ProcessedFile {
+			shrink::Result result;
+			shrink::Language lang = shrink::Language::Auto;
+			bool included = false;
+		};
+		std::vector<ProcessedFile> processed(q.size());
+		std::atomic<size_t> nextFile{0};
+		auto processFiles = [&]() {
+			while (true) {
+				const size_t index = nextFile.fetch_add(1, std::memory_order_relaxed);
+				if (index >= q.size()) break;
+				std::ifstream file(q[index].fullPath, std::ios::binary);
+				if (!file.is_open()) continue;
+				std::string raw((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+				shrink::Options fileOpt = optCopy;
+				if (fileOpt.lang == shrink::Language::Auto) fileOpt.lang = detectLanguage(q[index].fullPath);
+				auto result = shrink::process(raw, fileOpt);
+				if (!result.syntax_valid) continue;
+				processed[index].result = std::move(result);
+				processed[index].lang = fileOpt.lang;
+				processed[index].included = true;
+			}
+		};
+		const size_t workerCount = std::min(q.size(), static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency())));
+		std::vector<std::thread> workers;
+		workers.reserve(workerCount > 0 ? workerCount - 1 : 0);
+		for (size_t i = 1; i < workerCount; ++i) workers.emplace_back(processFiles);
+		processFiles();
+		for (auto &worker : workers) worker.join();
+		BundleResult bundle;
+		bundle.metrics.totalCount = static_cast<int>(q.size());
+		for (size_t i = 0; i < q.size(); ++i) {
+			if (!processed[i].included) continue;
+			const auto &result = processed[i].result;
+			++bundle.metrics.processedCount;
+			bundle.metrics.totalInBytes += result.in_bytes;
+			bundle.metrics.totalOutBytes += result.out_bytes;
+			bundle.metrics.totalInLines += result.in_lines;
+			bundle.metrics.totalOutLines += result.out_lines;
+		}
 		struct TreeNode {
 			std::string name;
 			bool is_file = false;
@@ -441,7 +501,7 @@ void ShrinkController::generateLlmBundle() {
 				}
 			}
 		}
-		std::string out = "# LLM Context Bundle\n\nPliki: " + std::to_string(q.size()) + "\n\n## Drzewo projektu\n\n```text\n.\n";
+		std::string out = "# LLM Context Bundle\n\nPliki: " + std::to_string(bundle.metrics.processedCount) + " / " + std::to_string(q.size()) + "\n\n## Drzewo projektu\n\n```text\n.\n";
 		std::function<void(const TreeNode &, const std::string &)> printTree = [&](const TreeNode &node, const std::string &prefix) {
 			size_t total = node.children.size();
 			size_t current = 0;
@@ -456,23 +516,20 @@ void ShrinkController::generateLlmBundle() {
 		};
 		printTree(rootNode, "");
 		out += "```\n";
-		for (const auto &item : q) {
-			std::ifstream file(item.fullPath, std::ios::binary);
-			if (!file.is_open()) continue;
-			std::string raw((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-			shrink::Options fileOpt = optCopy;
-			if (fileOpt.lang == shrink::Language::Auto) fileOpt.lang = detectLanguage(item.fullPath);
-			auto res = shrink::process(raw, fileOpt);
-			if (!res.syntax_valid) continue;
+		for (size_t i = 0; i < q.size(); ++i) {
+			if (!processed[i].included) continue;
+			const auto &item = q[i];
+			const auto &res = processed[i].result;
 			size_t maxTicks = 0, cur = 0;
 			for (char c : res.output) { if (c == '`') { ++cur; maxTicks = std::max(maxTicks, cur); } else cur = 0; }
 			std::string fence(std::max<size_t>(3, maxTicks + 1), '`');
-			out += "\n### Plik: " + item.relPath + "\n\n" + fence + languageToFence(fileOpt.lang).toStdString() + "\n";
+			out += "\n### Plik: " + item.relPath + "\n\n" + fence + languageToFence(processed[i].lang).toStdString() + "\n";
 			out += res.output;
 			if (!res.output.empty() && res.output.back() != '\n') out += "\n";
 			out += fence + "\n";
 		}
-		return QString::fromStdString(out);
+		bundle.markdown = QString::fromStdString(out);
+		return bundle;
 	}));
 }
 

@@ -34,10 +34,18 @@ private:
 	QCheckBox *m_chkCompactTypes = nullptr;
 	QCheckBox *m_chkModernizeNamespaces = nullptr;
 	QCheckBox *m_chkStripComments = nullptr;
+	QCheckBox *m_chkStripAnnotations = nullptr;
+	QCheckBox *m_chkStripUnusedImports = nullptr;
+	QCheckBox *m_chkXmlAggressive = nullptr;
+	QCheckBox *m_chkWebCompact = nullptr;
+	QCheckBox *m_chkCompactArrows = nullptr;
 	QCheckBox *m_chkUnwrapParentheses = nullptr;
 	QCheckBox *m_chkCompactShortFunctions = nullptr;
 	QCheckBox *m_chkStripAttributes = nullptr;
 	QCheckBox *m_chkStripDebug = nullptr;
+	QCheckBox *m_chkJavaStripDebug = nullptr;
+	QCheckBox *m_chkWebStripDebug = nullptr;
+	QCheckBox *m_chkWebSkeleton = nullptr;
 	QCheckBox *m_chkStripDocstrings = nullptr;
 	QCheckBox *m_chkStripTypes = nullptr;
 	QCheckBox *m_chkVerifySyntax = nullptr;
@@ -45,6 +53,8 @@ private:
 	QPushButton *m_btnImportProfile = nullptr;
 	QWidget *m_cppSection = nullptr;
 	QWidget *m_pythonSection = nullptr;
+	QWidget *m_javaSection = nullptr;
+	QWidget *m_webSection = nullptr;
 	QWidget *m_scrollContent = nullptr;
 	void setupUi();
 	void updateLanguageVisibility(shrink::Language lang);

@@ -1,4 +1,5 @@
 #include "metrics_bundle_view.h"
+#include "shrink_controller.h"
 #include <fstream>
 #include <string>
 #include <QClipboard>
@@ -78,8 +79,19 @@ void MetricsBundleView::onBatchFinished(int, int, quint64 totalInBytes, quint64 
 	m_lblTokens->setText(QStringLiteral("Zysk: ~%1 tok (%2 -> %3)").arg(savedTokens).arg(inTokens).arg(outTokens));
 }
 
-void MetricsBundleView::onLlmBundleGenerated(const QString &bundleMarkdown) {
-	m_bundleView->setPlainText(bundleMarkdown);
+void MetricsBundleView::onLlmBundleGenerated(const BundleResult &result) {
+	m_bundleView->setPlainText(result.markdown);
+	const auto &metrics = result.metrics;
+	m_lblBytes->setText(QStringLiteral("%1 B -> %2 B").arg(metrics.totalInBytes).arg(metrics.totalOutBytes));
+	const double reduction = metrics.totalInBytes > 0
+		? (1.0 - static_cast<double>(metrics.totalOutBytes) / static_cast<double>(metrics.totalInBytes)) * 100.0
+		: 0.0;
+	m_lblReduction->setText(QString::asprintf("%.1f%%", reduction));
+	m_lblLines->setText(QStringLiteral("%1 LOC -> %2 LOC").arg(metrics.totalInLines).arg(metrics.totalOutLines));
+	const quint64 inTokens = metrics.totalInBytes / 4;
+	const quint64 outTokens = metrics.totalOutBytes / 4;
+	const quint64 savedTokens = inTokens > outTokens ? inTokens - outTokens : 0;
+	m_lblTokens->setText(QStringLiteral("Zysk: ~%1 tok (%2 -> %3)").arg(savedTokens).arg(inTokens).arg(outTokens));
 }
 
 void MetricsBundleView::copyBundleToClipboard() {
