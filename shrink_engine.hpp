@@ -134,6 +134,7 @@ struct Token {
 
 struct GitIgnoreRule {
 	std::string pattern;
+	std::unique_ptr<re2::RE2> compiled_re;
 	bool is_negation = false;
 	bool dir_only = false;
 	bool anchored = false;

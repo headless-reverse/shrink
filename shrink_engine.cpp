@@ -92,40 +92,47 @@ inline bool is_boundary(std::string_view s, size_t pos, size_t len) noexcept {
 	return true;
 }
 
-bool glob_match(std::string_view pat, std::string_view str) noexcept {
-	if (pat.empty()) return str.empty();
-	if (pat == "*") return true;
-
-	if (pat.starts_with("**/")) {
-		std::string_view rest = pat.substr(3);
-		if (glob_match(rest, str)) return true;
-		for (size_t i = 0; i < str.size(); ++i) {
-			if (str[i] == '/' && glob_match(pat, str.substr(i + 1))) return true;
+std::string gitignore_regex(std::string_view pattern, bool anchored) {
+	std::string out = anchored ? "^" : "(?:^|.*/)";
+	for (size_t i = 0; i < pattern.size(); ++i) {
+		const char c = pattern[i];
+		if (c == '\\' && i + 1 < pattern.size()) {
+			const char literal = pattern[++i];
+			if (std::string_view(".()+|{}[]^$\\").find(literal) != std::string_view::npos) out.push_back('\\');
+			out.push_back(literal);
+		} else if (c == '*') {
+			if (i + 1 < pattern.size() && pattern[i + 1] == '*') {
+				++i;
+				if (i + 1 < pattern.size() && pattern[i + 1] == '/') {
+					++i;
+					out += "(?:.*/)?";
+				} else out += ".*";
+			} else out += "[^/]*";
+		} else if (c == '[') {
+			size_t close = i + 1;
+			if (close < pattern.size() && pattern[close] == '!') ++close;
+			if (close < pattern.size() && pattern[close] == ']') ++close;
+			while (close < pattern.size() && pattern[close] != ']') ++close;
+			if (close == pattern.size()) out += "\\[";
+			else {
+				out.push_back('[');
+				size_t member = i + 1;
+				if (member < close && pattern[member] == '!') { out.push_back('^'); ++member; }
+				for (; member < close; ++member) {
+					if (pattern[member] == '\\' && member + 1 < close) ++member;
+					out.push_back(pattern[member]);
+				}
+				out.push_back(']');
+				i = close;
+			}
+		} else if (c == '?') out += "[^/]";
+		else {
+			if (std::string_view(".()+|{}[]^$\\").find(c) != std::string_view::npos) out.push_back('\\');
+			out.push_back(c);
 		}
-		return false;
 	}
-
-	size_t p = 0, s = 0;
-	size_t star_p = std::string_view::npos, star_s = 0;
-
-	while (s < str.size()) {
-		if (p < pat.size() && (pat[p] == str[s] || (pat[p] == '?' && str[s] != '/'))) {
-			++p;
-			++s;
-		} else if (p < pat.size() && pat[p] == '*') {
-			star_p = p++;
-			star_s = s;
-		} else if (star_p != std::string_view::npos) {
-			if (str[star_s] == '/') return false;
-			p = star_p + 1;
-			s = ++star_s;
-		} else {
-			return false;
-		}
-	}
-
-	while (p < pat.size() && pat[p] == '*') ++p;
-	return p == pat.size();
+	out += "(/.*)?$";
+	return out;
 }
 
 }
@@ -155,7 +162,10 @@ void GitIgnoreEngine::add_rule(std::string_view raw) {
 		r.anchored = true;
 	}
 
+	if (raw.empty()) return;
 	r.pattern = std::string(raw);
+	r.compiled_re = std::make_unique<re2::RE2>(gitignore_regex(r.pattern, r.anchored));
+	if (!r.compiled_re->ok()) return;
 	rules.push_back(std::move(r));
 }
 
@@ -183,23 +193,21 @@ void GitIgnoreEngine::load_file(const std::filesystem::path& path) {
 
 bool GitIgnoreEngine::is_ignored(std::string_view rel_path, bool is_dir) const noexcept {
 	if (rel_path == ".git" || rel_path.starts_with(".git/")) return true;
-
-	std::string_view basename = rel_path;
-	size_t slash = rel_path.rfind('/');
-	if (slash != std::string_view::npos) basename = rel_path.substr(slash + 1);
-
 	bool ignored = false;
+	bool parent_locked_out = false;
 	for (const auto& r : rules) {
-		if (r.dir_only && !is_dir) continue;
-		bool match = false;
-		if (r.anchored) {
-			match = glob_match(r.pattern, rel_path);
-		} else {
-			match = glob_match(r.pattern, basename) || glob_match(r.pattern, rel_path);
-		}
+		if (!r.compiled_re) continue;
+		std::string suffix;
+		const bool match = re2::RE2::FullMatch(std::string(rel_path), *r.compiled_re, &suffix)
+			&& (!r.dir_only || is_dir || !suffix.empty());
 
 		if (match) {
-			ignored = !r.is_negation;
+			if (r.is_negation) {
+				if (!parent_locked_out) ignored = false;
+			} else {
+				ignored = true;
+				if (rel_path.find('/') != std::string_view::npos && !suffix.empty()) parent_locked_out = true;
+			}
 		}
 	}
 	return ignored;
